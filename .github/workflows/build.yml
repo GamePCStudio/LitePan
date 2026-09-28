@@ -41,55 +41,31 @@ jobs:
             goarch: amd64
             goarm: ""
             tags: fuse
-            cgo: false
-            pie: false
-            cc: ""
           - name: linux-arm64
             goos: linux
             goarch: arm64
             goarm: ""
             tags: fuse
-            cgo: false
-            pie: false
-            cc: ""
           - name: linux-arm64-nofuse
             goos: linux
             goarch: arm64
             goarm: ""
             tags: ""
-            cgo: false
-            pie: false
-            cc: ""
           - name: linux-armv7
             goos: linux
             goarch: arm
             goarm: "7"
             tags: ""
-            cgo: false
-            pie: false
-            cc: ""
           - name: linux-armv6
             goos: linux
             goarch: arm
             goarm: "6"
             tags: ""
-            cgo: false
-            pie: false
-            cc: ""
           # 纯静态 GOOS=linux 产物一律是 ET_EXEC 非 PIE（实测：arm64/armv6 都是）。
-          # Android 9+ 是否拒绝非 PIE 需要真机验证，故另出下方 NDK/bionic 的 PIE 产物。
-          # 注意 GOOS=android + CGO_ENABLED=0 编不过（anacrolix/torrent 依赖的
-          # wlynxg/anet 用 go:linkname 引用 net.zoneCache，只有 cgo 版 net 才有该符号），
-          # 所以这里不再尝试 GOOS=android 的纯 Go 产物。
-          - name: android-arm64-pie
-            goos: android
-            goarch: arm64
-            goarm: ""
-            tags: ""
-            cgo: true
-            pie: true
-            cc: aarch64-linux-android21-clang
-            experimental: true
+          # Android 9+ 是否拒绝非 PIE 需真机验证，故另出 static-pie job（musl 静态 PIE）。
+          # 不再尝试 GOOS=android：run #9 实测 arm64 报 wlynxg/anet 的
+          # "invalid reference to net.zoneCache"（该依赖为 anacrolix/torrent 传递引入），
+          # 且 ubuntu-24.04 runner 上也没有 gcc-aarch64-linux-android 这个包。
 
     continue-on-error: ${{ matrix.experimental == true }}
     steps:
@@ -117,25 +93,16 @@ jobs:
           GOTOOLCHAIN: local
           OUT: litepan-${{ steps.ver.outputs.value }}-${{ matrix.name }}
           TAGS: ${{ matrix.tags }}
-          PIE: ${{ matrix.pie }}
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
-          CGO_ENABLED: ${{ matrix.cgo && '1' || '0' }}
-          CC: ${{ matrix.cc }}
+          CGO_ENABLED: "0"
         run: |
           set -eux
-          if [ "${{ matrix.cgo }}" = "true" ]; then
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-android
-            "$CC" --version | head -1
-          fi
           EXTRA_TAGS=""
           if [ -n "$TAGS" ]; then EXTRA_TAGS="-tags $TAGS"; fi
-          MODE=""
-          if [ "$PIE" = "true" ]; then MODE="-buildmode=pie"; fi
-          go build $MODE $EXTRA_TAGS -trimpath -ldflags="-s -w" -o "$OUT" "$BIN_PKG"
-          if [ -z "${CC:-}" ]; then strip "$OUT" || true; fi
+          go build $EXTRA_TAGS -trimpath -ldflags="-s -w" -o "$OUT" "$BIN_PKG"
+          strip "$OUT" || true
           ls -l "$OUT"
           sha256sum "$OUT" | tee "${OUT}.sha256"
 
@@ -153,11 +120,25 @@ jobs:
           path: litepan-*
           if-no-files-found: error
 
-  # 32 位静态 PIE：只给强制 PIE 的机型兜底。代价是必须开 cgo(musl)，
-  # 会引入 musl 分配器全局锁 + cgo DNS，性能明显低于 linux-armv7，见可行性报告。
-  armv7-static-pie:
-    name: linux-armv7-pie (musl, 实验性)
+  # 静态 PIE 兜底：给「内核强制 PIE」的机型（Android 9+ 待真机确认）。
+  # 代价是必须开 cgo(musl)：引入 musl 分配器全局锁 + cgo DNS，性能低于纯静态产物，
+  # 且 /etc 在 Android 上不存在，musl 同样读不到 resolv.conf —— 详见可行性报告。
+  static-pie:
+    name: ${{ matrix.name }} (musl, 实验性)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-armv7-pie
+            image: dockcross/linux-armv7l-musl
+            goarch: arm
+            goarm: "7"
+          - name: linux-arm64-pie
+            image: dockcross/linux-arm64-musl
+            goarch: arm64
+            goarm: ""
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -172,7 +153,7 @@ jobs:
             V="$(git rev-parse --short HEAD)"
           fi
           echo "value=$V" >> "$GITHUB_OUTPUT"
-          awk '/^go[ 	]+[0-9]/{print "go_ver="$2; exit}' go.mod >> "$GITHUB_OUTPUT"
+          awk '/^go[ \t]+[0-9]/{print "go_ver="$2; exit}' go.mod >> "$GITHUB_OUTPUT"
 
       - name: Build static PIE with dockcross + musl
         run: |
@@ -180,50 +161,55 @@ jobs:
           VER="${{ steps.ver.outputs.value }}"
           GOVER="${{ steps.ver.outputs.go_ver }}"
           test -n "$GOVER"
-          docker run --rm dockcross/linux-armv7l-musl > ./dockcross
+          docker run --rm ${{ matrix.image }} > ./dockcross
           chmod +x ./dockcross
           # dockcross 的 cc 包装器只转发它自己那组变量（CC/CXX 等），自定义变量进容器
-          # 一律 unbound。所以把容器脚本落成文件再执行，避免多层引号互相吞转义。
+          # 一律 unbound（run #9 就是这么炸的）。所以把容器脚本落成文件、用位置参数传入。
           cat > build-in-musl-container.sh <<'OUTER'
           VER="$1"
           GOVER="$2"
+          GOARCH="$3"
+          GOARM="$4"
+          NAME="$5"
           cat > inside.sh <<'INNER'
           set -eux
+          echo "go=$GOVER arch=$GOARCH arm=$GOARM out=$NAME"
           "$CC" --version | head -1
           curl -sSL "https://go.dev/dl/go${GOVER}.linux-amd64.tar.gz" -o /tmp/go.tgz
           tar -C /usr/local -xzf /tmp/go.tgz
           export PATH=/usr/local/go/bin:"$PATH"
-          export GOTOOLCHAIN=local CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7
-          OUT="litepan-${VER}-linux-armv7-pie"
-          go build -buildmode=pie -trimpath \
-            -ldflags "-s -w -linkmode external -extldflags=-static" -o "$OUT" ./cmd/litepan \
-          || go build -buildmode=pie -trimpath \
-            -ldflags "-s -w -linkmode external -extldflags=-static-pie" -o "$OUT" ./cmd/litepan
+          export GOTOOLCHAIN=local CGO_ENABLED=1 GOOS=linux GOARCH="$GOARCH"
+          if [ -n "$GOARM" ]; then export GOARM="$GOARM"; fi
+          OUT="$NAME"
+          go build -buildmode=pie -trimpath -ldflags "-s -w -linkmode external -extldflags=-static" -o "$OUT" ./cmd/litepan
           ls -l "$OUT"
           INNER
+          export VER GOVER GOARCH GOARM NAME
           bash inside.sh
           OUTER
-          ./dockcross bash ./build-in-musl-container.sh "$VER" "$GOVER"
+          ./dockcross bash ./build-in-musl-container.sh \
+            "$VER" "$GOVER" "${{ matrix.goarch }}" "${{ matrix.goarm }}" \
+            "litepan-${VER}-${{ matrix.name }}"
           sudo chown -R "$(id -u):$(id -g)" litepan-*
-          sha256sum litepan-* | tee "litepan-${VER}-linux-armv7-pie.sha256"
+          sha256sum litepan-* | tee "litepan-${VER}-${{ matrix.name }}.sha256"
           ls -l litepan-*
 
       - name: Verify ELF for Android
         run: |
           set -eux
           python3 .github/scripts/check_elf_android.py \
-            "litepan-${{ steps.ver.outputs.value }}-linux-armv7-pie"
+            "litepan-${{ steps.ver.outputs.value }}-${{ matrix.name }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.ver.outputs.value }}-linux-armv7-pie
+          name: ${{ steps.ver.outputs.value }}-${{ matrix.name }}
           path: litepan-*
           if-no-files-found: error
 
   release:
     name: Publish release
-    needs: [build, armv7-static-pie]
+    needs: [build, static-pie]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
