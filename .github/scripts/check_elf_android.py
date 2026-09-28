@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """校验交叉编译产物能否在 Android 6~11 的 linux shell 下被内核直接 exec。
 
-两条硬判据（对应常见踩坑）：
-  1. 不能出现 PT_INTERP —— Android 只有 /system/bin/linker(64)，
-     Go 走 -linkmode external 或 -buildmode=pie+glibc 时会写进
-     /lib/ld-linux-*.so.1 / ld-musl-*，这类产物在设备上 exec 直接失败。
-  2. 32 位 ARM 必须带 EF_ARM_ABI_FLOAT_HARD(0x400) 与 HAS_MOVW/MOVT(0x100)，
-     即真正按 GOARM=7 编译；否则是 GOARM=5 基线，浮点走软件序列。
+唯一可靠的硬判据是「有没有 PT_INTERP」：
+  - 纯 Go 内部链接的静态非 PIE 产物没有 PT_INTERP，内核直接映射，Android 上能 exec；
+  - -buildmode=pie 走外部链接时 Go 会把主机的 ld-linux/ld-musl 路径写进 PT_INTERP，
+    设备上不存在这个加载器，exec 直接失败（旧 linux-arm64-pie 产物实测如此）。
+
+不要拿 e_flags 的 EF_ARM_ABI_FLOAT_HARD 当 GOARM 判据：实测 Go 1.26.6 内部链接时
+GOARM=6 与 GOARM=7 产出的 e_flags 都是 0x5000002，该位对 Go 自己的产物没有区分度。
 """
-import os
 import struct
 import sys
 
@@ -16,8 +16,6 @@ ET_EXEC = 2
 ET_DYN = 3
 EM_ARM = 40
 EM_AARCH64 = 183
-EF_ARM_HAS_MOVW_MOVT = 0x100
-EF_ARM_ABI_FLOAT_HARD = 0x400
 
 
 def read_header(d):
@@ -61,6 +59,14 @@ def expect_hard_float():
     return requested_goarm() == "7"
 
 
+ANDROID_LINKERS = (
+    "/system/bin/linker",
+    "/system/bin/linker64",
+    "/apex/com.android.runtime/bin/linker",
+    "/apex/com.android.runtime/bin/linker64",
+)
+
+
 def main(argv):
     if not argv:
         print("用法: check_elf_android.py <二进制...>")
@@ -69,29 +75,32 @@ def main(argv):
     for path in argv:
         with open(path, "rb") as fh:
             d = fh.read()
-        cls, endian, etype, machine, entry, phoff, flags, phentsize, phnum = read_header(d)
+        if d[:4] != b"\x7fELF":
+            print(f"{path}: 非 ELF，跳过")
+            continue
+        try:
+            cls, endian, etype, machine, entry, phoff, flags, phentsize, phnum = read_header(d)
+        except (ValueError, struct.error) as exc:
+            print(f"  FAIL  {path}: 读 ELF 头失败 {exc}")
+            failures.append(path)
+            continue
         interps = interpreters(d, cls, endian, phoff, phentsize, phnum)
         arch = {EM_ARM: "arm32", EM_AARCH64: "arm64"}.get(machine, f"machine={machine}")
         print(f"{path}: ELF{'32' if cls == 1 else '64'} {arch} "
               f"type={'ET_EXEC' if etype == ET_EXEC else 'ET_DYN/PIE' if etype == ET_DYN else etype} "
-              f"entry=0x{entry:x} e_flags=0x{flags:08x} interp={interps or 'none(静态)'}")
-        if interps:
-            msg = f"{path}: 含 PT_INTERP {interps}，Android 无此动态加载器，exec 会失败"
-        elif machine == EM_ARM and bool(flags & EF_ARM_ABI_FLOAT_HARD) != expect_hard_float():
-            want = "硬浮点(0x400)" if expect_hard_float() else "软浮点(不置 0x400)"
-            msg = (f"{path}: e_flags=0x{flags:08x} 与请求的 GOARM={requested_goarm()} 不符，"
-                   f"期望 {want} —— GOARM 没真正生效，浮点会走软件序列")
+              f"entry=0x{entry:x} e_flags=0x{flags:08x} interp={interps or 'none(纯静态)'}")
+        bad = [i for i in interps if not any(i.startswith(a) for a in ANDROID_LINKERS)]
+        if bad:
+            msg = f"{path}: PT_INTERP={bad}，Android 上没有该加载器，exec 会失败"
+        elif etype == ET_EXEC:
+            msg = None
+            print("  OK    纯静态非 PIE；Android 6~8 可直接 exec，Android 9+ 内核强制 PIE 时需换 PIE 产物")
         else:
             msg = None
-            if machine == EM_ARM and not (flags & EF_ARM_HAS_MOVW_MOVT):
-                # 外部链接（musl/cgo）时 e_flags 取自工具链启动对象，不代表 Go 代码的指令集，
-                # 只在纯 Go 内部链接场景才是 GOARM 判据，所以这里仅提示不判失败。
-                print("  NOTE  未置 HAS_MOVW/MOVT(0x100)：外部链接时该位由工具链决定，非 GOARM 判据")
+            print("  OK    静态且由 Android linker 加载（PIE），Android 6~11 均可 exec")
         if msg:
             print(f"  FAIL  {msg}")
             failures.append(msg)
-        else:
-            print("  OK    可被 Android 内核直接 exec")
     return 1 if failures else 0
 
 

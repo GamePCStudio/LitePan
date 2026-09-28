@@ -3,8 +3,9 @@ name: Build LitePan Binaries
 # 面向 Android 6.0~11.0 的 linux shell（adb shell / Termux）交叉构建。
 # 关键约束（均已在 v0.5.3-beta 产物上实测）：
 #   1) 一律 CGO_ENABLED=0 —— 纯 Go 静态产物无 PT_INTERP，不依赖 glibc/musl/bionic。
-#   2) 32 位必须显式 GOARM=7：CI 里不带 GOARM 时实测产出 e_flags=0x5000002
-#      （无 EF_ARM_ABI_FLOAT_HARD、无 HAS_MOVW/MOWT），即 GOARM=5 基线。
+#   2) GOARM 只影响指令集选择，不是 ABI 标记：实测 Go 1.26.6 内部链接下
+#      GOARM=6 与 GOARM=7 产出的 e_flags 都是 0x5000002（都不置 FLOAT_HARD），
+#      所以别拿 e_flags 反推 GOARM，也别用它当构建门禁。
 #   3) -buildmode=pie 在 GOARCH=arm 下无法内部链接；arm64 的 PIE 又会带上
 #      PT_INTERP=/lib/ld-linux-aarch64.so.1，Android 上同样起不来 —— 所以 PIE
 #      只保留下方 dockcross/musl 的 armv7 一条路（真静态 PIE，无 PT_INTERP）。
@@ -60,7 +61,25 @@ jobs:
             goarch: arm
             goarm: "6"
             tags: ""
+          # 纯静态 GOOS=linux 产物一律是 ET_EXEC 非 PIE（实测：arm64/armv6 都是），
+          # 而 Android 9+ 的 PIE 强制在内核 load_elf_binary 里、与 SELinux 无关，
+          # 所以 Android 10/11 上必须另有 PIE 版本。GOOS=android 是官方正解路径，
+          # 旧 CI 曾因其上叠 -buildmode=pie 失败而整体放弃（错误信息是 buildmode 的，
+          # 不是 GOOS=android 的），这里单独试纯 GOOS=android + CGO=0，先标实验性。
+          - name: android-arm64
+            goos: android
+            goarch: arm64
+            goarm: ""
+            tags: ""
+            experimental: true
+          - name: android-arm
+            goos: android
+            goarch: arm
+            goarm: "7"
+            tags: ""
+            experimental: true
 
+    continue-on-error: ${{ matrix.experimental == true }}
     steps:
       - uses: actions/checkout@v4
 
@@ -99,11 +118,8 @@ jobs:
           ls -l "$OUT"
           sha256sum "$OUT" | tee "${OUT}.sha256"
 
-      # 每个产物都校验 ELF 头：Android 只接受无 PT_INTERP 的静态 ELF；
-      # 32 位必须带 EF_ARM_ABI_FLOAT_HARD，否则说明 GOARM=7 没生效。
+      # 每个产物都校验 ELF 头：只有 PT_INTERP 是硬判据（e_flags 对 Go 产物无区分度）。
       - name: Verify ELF for Android
-        env:
-          GOARM: ${{ matrix.goarm }}
         run: |
           set -eux
           python3 .github/scripts/check_elf_android.py \
@@ -139,22 +155,26 @@ jobs:
       - name: Build static PIE with dockcross + musl
         run: |
           set -eux
-          VER="${{ steps.ver.outputs.value }}"
-          GOVER="$(sed -n 's/^go[[:space:]]*\([0-9.]*\)$/\1/p' go.mod)"
+          export VER="${{ steps.ver.outputs.value }}"
+          export GOVER="$(sed -n 's/^go[[:space:]]*\([0-9.]*\)$/\1/p' go.mod)"
+          test -n "$GOVER"
           docker run --rm dockcross/linux-armv7l-musl > ./dockcross
           chmod +x ./dockcross
-          ./dockcross bash -c "set -eux; \
-            \${CC} --version | head -1; \
-            curl -sSL https://go.dev/dl/go\${GOVER}.linux-amd64.tar.gz -o /tmp/go.tgz; \
+          # 容器里是 set -u 的 bash：所有变量必须由上面的 env 传进来，
+          # 不能再写 ${{ }} （那是 runner 展开，会被外层 shell 吃掉）。
+          ./dockcross bash -c 'set -eux; \
+            echo "go=$GOVER ver=$VER"; \
+            ${CC} --version | head -1; \
+            curl -sSL "https://go.dev/dl/go${GOVER}.linux-amd64.tar.gz" -o /tmp/go.tgz; \
             tar -C /usr/local -xzf /tmp/go.tgz; \
-            export PATH=/usr/local/go/bin:\$PATH GOTOOLCHAIN=local; \
+            export PATH=/usr/local/go/bin:$PATH GOTOOLCHAIN=local; \
             export CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7; \
-            OUT=litepan-\${VER}-linux-armv7-pie; \
+            OUT=litepan-${VER}-linux-armv7-pie; \
             go build -buildmode=pie -trimpath \
-              -ldflags '-s -w -linkmode external -extldflags=-static' -o \"\$OUT\" ./cmd/litepan \
+              -ldflags "-s -w -linkmode external -extldflags=-static" -o "$OUT" ./cmd/litepan \
             || go build -buildmode=pie -trimpath \
-              -ldflags '-s -w -linkmode external -extldflags=-static-pie' -o \"\$OUT\" ./cmd/litepan; \
-            ls -l \"\$OUT\""
+              -ldflags "-s -w -linkmode external -extldflags=-static-pie" -o "$OUT" ./cmd/litepan; \
+            ls -l "$OUT"'
           sudo chown -R "$(id -u):$(id -g)" litepan-*
           sha256sum litepan-* | tee "litepan-${VER}-linux-armv7-pie.sha256"
           ls -l litepan-*
