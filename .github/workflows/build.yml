@@ -41,42 +41,54 @@ jobs:
             goarch: amd64
             goarm: ""
             tags: fuse
+            cgo: false
+            pie: false
+            cc: ""
           - name: linux-arm64
             goos: linux
             goarch: arm64
             goarm: ""
             tags: fuse
+            cgo: false
+            pie: false
+            cc: ""
           - name: linux-arm64-nofuse
             goos: linux
             goarch: arm64
             goarm: ""
             tags: ""
+            cgo: false
+            pie: false
+            cc: ""
           - name: linux-armv7
             goos: linux
             goarch: arm
             goarm: "7"
             tags: ""
+            cgo: false
+            pie: false
+            cc: ""
           - name: linux-armv6
             goos: linux
             goarch: arm
             goarm: "6"
             tags: ""
-          # 纯静态 GOOS=linux 产物一律是 ET_EXEC 非 PIE（实测：arm64/armv6 都是），
-          # 而 Android 9+ 的 PIE 强制在内核 load_elf_binary 里、与 SELinux 无关，
-          # 所以 Android 10/11 上必须另有 PIE 版本。GOOS=android 是官方正解路径，
-          # 旧 CI 曾因其上叠 -buildmode=pie 失败而整体放弃（错误信息是 buildmode 的，
-          # 不是 GOOS=android 的），这里单独试纯 GOOS=android + CGO=0，先标实验性。
-          - name: android-arm64
+            cgo: false
+            pie: false
+            cc: ""
+          # 纯静态 GOOS=linux 产物一律是 ET_EXEC 非 PIE（实测：arm64/armv6 都是）。
+          # Android 9+ 是否拒绝非 PIE 需要真机验证，故另出下方 NDK/bionic 的 PIE 产物。
+          # 注意 GOOS=android + CGO_ENABLED=0 编不过（anacrolix/torrent 依赖的
+          # wlynxg/anet 用 go:linkname 引用 net.zoneCache，只有 cgo 版 net 才有该符号），
+          # 所以这里不再尝试 GOOS=android 的纯 Go 产物。
+          - name: android-arm64-pie
             goos: android
             goarch: arm64
             goarm: ""
             tags: ""
-            experimental: true
-          - name: android-arm
-            goos: android
-            goarch: arm
-            goarm: "7"
-            tags: ""
+            cgo: true
+            pie: true
+            cc: aarch64-linux-android21-clang
             experimental: true
 
     continue-on-error: ${{ matrix.experimental == true }}
@@ -102,19 +114,28 @@ jobs:
 
       - name: Build
         env:
-          CGO_ENABLED: "0"
           GOTOOLCHAIN: local
+          OUT: litepan-${{ steps.ver.outputs.value }}-${{ matrix.name }}
+          TAGS: ${{ matrix.tags }}
+          PIE: ${{ matrix.pie }}
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
-          TAGS: ${{ matrix.tags }}
+          CGO_ENABLED: ${{ matrix.cgo && '1' || '0' }}
+          CC: ${{ matrix.cc }}
         run: |
           set -eux
-          OUT="litepan-${{ steps.ver.outputs.value }}-${{ matrix.name }}"
+          if [ "${{ matrix.cgo }}" = "true" ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-android
+            "$CC" --version | head -1
+          fi
           EXTRA_TAGS=""
           if [ -n "$TAGS" ]; then EXTRA_TAGS="-tags $TAGS"; fi
-          go build $EXTRA_TAGS -trimpath -ldflags="-s -w" -o "$OUT" "$BIN_PKG"
-          strip "$OUT" || true
+          MODE=""
+          if [ "$PIE" = "true" ]; then MODE="-buildmode=pie"; fi
+          go build $MODE $EXTRA_TAGS -trimpath -ldflags="-s -w" -o "$OUT" "$BIN_PKG"
+          if [ -z "${CC:-}" ]; then strip "$OUT" || true; fi
           ls -l "$OUT"
           sha256sum "$OUT" | tee "${OUT}.sha256"
 
@@ -151,30 +172,38 @@ jobs:
             V="$(git rev-parse --short HEAD)"
           fi
           echo "value=$V" >> "$GITHUB_OUTPUT"
+          awk '/^go[ 	]+[0-9]/{print "go_ver="$2; exit}' go.mod >> "$GITHUB_OUTPUT"
 
       - name: Build static PIE with dockcross + musl
         run: |
           set -eux
-          export VER="${{ steps.ver.outputs.value }}"
-          export GOVER="$(sed -n 's/^go[[:space:]]*\([0-9.]*\)$/\1/p' go.mod)"
+          VER="${{ steps.ver.outputs.value }}"
+          GOVER="${{ steps.ver.outputs.go_ver }}"
           test -n "$GOVER"
           docker run --rm dockcross/linux-armv7l-musl > ./dockcross
           chmod +x ./dockcross
-          # 容器里是 set -u 的 bash：所有变量必须由上面的 export 传进来，
-          # 这里不能再依赖 runner 的表达式插值（会被外层 shell 吃掉）。
-          ./dockcross bash -c 'set -eux; \
-            echo "go=$GOVER ver=$VER"; \
-            ${CC} --version | head -1; \
-            curl -sSL "https://go.dev/dl/go${GOVER}.linux-amd64.tar.gz" -o /tmp/go.tgz; \
-            tar -C /usr/local -xzf /tmp/go.tgz; \
-            export PATH=/usr/local/go/bin:$PATH GOTOOLCHAIN=local; \
-            export CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7; \
-            OUT=litepan-${VER}-linux-armv7-pie; \
-            go build -buildmode=pie -trimpath \
-              -ldflags "-s -w -linkmode external -extldflags=-static" -o "$OUT" ./cmd/litepan \
-            || go build -buildmode=pie -trimpath \
-              -ldflags "-s -w -linkmode external -extldflags=-static-pie" -o "$OUT" ./cmd/litepan; \
-            ls -l "$OUT"'
+          # dockcross 的 cc 包装器只转发它自己那组变量（CC/CXX 等），自定义变量进容器
+          # 一律 unbound。所以把容器脚本落成文件再执行，避免多层引号互相吞转义。
+          cat > build-in-musl-container.sh <<'OUTER'
+          VER="$1"
+          GOVER="$2"
+          cat > inside.sh <<'INNER'
+          set -eux
+          "$CC" --version | head -1
+          curl -sSL "https://go.dev/dl/go${GOVER}.linux-amd64.tar.gz" -o /tmp/go.tgz
+          tar -C /usr/local -xzf /tmp/go.tgz
+          export PATH=/usr/local/go/bin:"$PATH"
+          export GOTOOLCHAIN=local CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7
+          OUT="litepan-${VER}-linux-armv7-pie"
+          go build -buildmode=pie -trimpath \
+            -ldflags "-s -w -linkmode external -extldflags=-static" -o "$OUT" ./cmd/litepan \
+          || go build -buildmode=pie -trimpath \
+            -ldflags "-s -w -linkmode external -extldflags=-static-pie" -o "$OUT" ./cmd/litepan
+          ls -l "$OUT"
+          INNER
+          bash inside.sh
+          OUTER
+          ./dockcross bash ./build-in-musl-container.sh "$VER" "$GOVER"
           sudo chown -R "$(id -u):$(id -g)" litepan-*
           sha256sum litepan-* | tee "litepan-${VER}-linux-armv7-pie.sha256"
           ls -l litepan-*
