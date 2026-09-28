@@ -160,8 +160,8 @@ jobs:
           test -n "$GOVER"
           docker run --rm dockcross/linux-armv7l-musl > ./dockcross
           chmod +x ./dockcross
-          # 容器里是 set -u 的 bash：所有变量必须由上面的 env 传进来，
-          # 不能再写 ${{ }} （那是 runner 展开，会被外层 shell 吃掉）。
+          # 容器里是 set -u 的 bash：所有变量必须由上面的 export 传进来，
+          # 这里不能再依赖 runner 的表达式插值（会被外层 shell 吃掉）。
           ./dockcross bash -c 'set -eux; \
             echo "go=$GOVER ver=$VER"; \
             ${CC} --version | head -1; \
@@ -180,8 +180,6 @@ jobs:
           ls -l litepan-*
 
       - name: Verify ELF for Android
-        env:
-          GOARM: "7"
         run: |
           set -eux
           python3 .github/scripts/check_elf_android.py \
