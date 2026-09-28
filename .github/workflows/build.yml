@@ -1,0 +1,192 @@
+name: Build LitePan Binaries
+
+# 面向 Android 6.0~11.0 的 linux shell（adb shell / Termux）交叉构建。
+# 关键约束（均已在 v0.5.3-beta 产物上实测）：
+#   1) 一律 CGO_ENABLED=0 —— 纯 Go 静态产物无 PT_INTERP，不依赖 glibc/musl/bionic。
+#   2) 32 位必须显式 GOARM=7：CI 里不带 GOARM 时实测产出 e_flags=0x5000002
+#      （无 EF_ARM_ABI_FLOAT_HARD、无 HAS_MOVW/MOWT），即 GOARM=5 基线。
+#   3) -buildmode=pie 在 GOARCH=arm 下无法内部链接；arm64 的 PIE 又会带上
+#      PT_INTERP=/lib/ld-linux-aarch64.so.1，Android 上同样起不来 —— 所以 PIE
+#      只保留下方 dockcross/musl 的 armv7 一条路（真静态 PIE，无 PT_INTERP）。
+#   4) Android 没有 /dev/fuse 的 FUSE 守护与 fuse3，故 GOARCH=arm 不编 -tags fuse。
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "产物命名用的版本号（留空则用 commit 短 sha）"
+        required: false
+        default: ""
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  BIN_PKG: ./cmd/litepan
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            goos: linux
+            goarch: amd64
+            goarm: ""
+            tags: fuse
+          - name: linux-arm64
+            goos: linux
+            goarch: arm64
+            goarm: ""
+            tags: fuse
+          - name: linux-arm64-nofuse
+            goos: linux
+            goarch: arm64
+            goarm: ""
+            tags: ""
+          - name: linux-armv7
+            goos: linux
+            goarch: arm
+            goarm: "7"
+            tags: ""
+          - name: linux-armv6
+            goos: linux
+            goarch: arm
+            goarm: "6"
+            tags: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            V="${{ github.event.inputs.tag_name }}"
+          elif [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+            V="${GITHUB_REF#refs/tags/}"
+          else
+            V="$(git rev-parse --short HEAD)"
+          fi
+          echo "value=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOTOOLCHAIN: local
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          TAGS: ${{ matrix.tags }}
+        run: |
+          set -eux
+          OUT="litepan-${{ steps.ver.outputs.value }}-${{ matrix.name }}"
+          EXTRA_TAGS=""
+          if [ -n "$TAGS" ]; then EXTRA_TAGS="-tags $TAGS"; fi
+          go build $EXTRA_TAGS -trimpath -ldflags="-s -w" -o "$OUT" "$BIN_PKG"
+          strip "$OUT" || true
+          ls -l "$OUT"
+          sha256sum "$OUT" | tee "${OUT}.sha256"
+
+      # 每个产物都校验 ELF 头：Android 只接受无 PT_INTERP 的静态 ELF；
+      # 32 位必须带 EF_ARM_ABI_FLOAT_HARD，否则说明 GOARM=7 没生效。
+      - name: Verify ELF for Android
+        env:
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          set -eux
+          python3 .github/scripts/check_elf_android.py \
+            "litepan-${{ steps.ver.outputs.value }}-${{ matrix.name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.ver.outputs.value }}-${{ matrix.name }}
+          path: litepan-*
+          if-no-files-found: error
+
+  # 32 位静态 PIE：只给强制 PIE 的机型兜底。代价是必须开 cgo(musl)，
+  # 会引入 musl 分配器全局锁 + cgo DNS，性能明显低于 linux-armv7，见可行性报告。
+  armv7-static-pie:
+    name: linux-armv7-pie (musl, 实验性)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            V="${{ github.event.inputs.tag_name }}"
+          elif [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+            V="${GITHUB_REF#refs/tags/}"
+          else
+            V="$(git rev-parse --short HEAD)"
+          fi
+          echo "value=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Build static PIE with dockcross + musl
+        run: |
+          set -eux
+          VER="${{ steps.ver.outputs.value }}"
+          GOVER="$(sed -n 's/^go[[:space:]]*\([0-9.]*\)$/\1/p' go.mod)"
+          docker run --rm dockcross/linux-armv7l-musl > ./dockcross
+          chmod +x ./dockcross
+          ./dockcross bash -c "set -eux; \
+            \${CC} --version | head -1; \
+            curl -sSL https://go.dev/dl/go\${GOVER}.linux-amd64.tar.gz -o /tmp/go.tgz; \
+            tar -C /usr/local -xzf /tmp/go.tgz; \
+            export PATH=/usr/local/go/bin:\$PATH GOTOOLCHAIN=local; \
+            export CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7; \
+            OUT=litepan-\${VER}-linux-armv7-pie; \
+            go build -buildmode=pie -trimpath \
+              -ldflags '-s -w -linkmode external -extldflags=-static' -o \"\$OUT\" ./cmd/litepan \
+            || go build -buildmode=pie -trimpath \
+              -ldflags '-s -w -linkmode external -extldflags=-static-pie' -o \"\$OUT\" ./cmd/litepan; \
+            ls -l \"\$OUT\""
+          sudo chown -R "$(id -u):$(id -g)" litepan-*
+          sha256sum litepan-* | tee "litepan-${VER}-linux-armv7-pie.sha256"
+          ls -l litepan-*
+
+      - name: Verify ELF for Android
+        env:
+          GOARM: "7"
+        run: |
+          set -eux
+          python3 .github/scripts/check_elf_android.py \
+            "litepan-${{ steps.ver.outputs.value }}-linux-armv7-pie"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.ver.outputs.value }}-linux-armv7-pie
+          path: litepan-*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [build, armv7-static-pie]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
