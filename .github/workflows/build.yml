@@ -1,0 +1,225 @@
+name: Build LitePan Binaries
+
+# 面向 Android 6.0~11.0 的 linux shell（adb shell / Termux）交叉构建。
+# 关键约束（均已在 v0.5.3-beta 产物上实测）：
+#   1) 一律 CGO_ENABLED=0 —— 纯 Go 静态产物无 PT_INTERP，不依赖 glibc/musl/bionic。
+#   2) GOARM 只影响指令集选择，不是 ABI 标记：实测 Go 1.26.6 内部链接下
+#      GOARM=6 与 GOARM=7 产出的 e_flags 都是 0x5000002（都不置 FLOAT_HARD），
+#      所以别拿 e_flags 反推 GOARM，也别用它当构建门禁。
+#   3) -buildmode=pie 在 GOARCH=arm 下无法内部链接；arm64 的 PIE 又会带上
+#      PT_INTERP=/lib/ld-linux-aarch64.so.1，Android 上同样起不来 —— 所以 PIE
+#      只保留下方 dockcross/musl 的 armv7 一条路（真静态 PIE，无 PT_INTERP）。
+#   4) Android 没有 /dev/fuse 的 FUSE 守护与 fuse3，故 GOARCH=arm 不编 -tags fuse。
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "产物命名用的版本号（留空则用 commit 短 sha）"
+        required: false
+        default: ""
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  BIN_PKG: ./cmd/litepan
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            goos: linux
+            goarch: amd64
+            goarm: ""
+            tags: fuse
+          - name: linux-arm64
+            goos: linux
+            goarch: arm64
+            goarm: ""
+            tags: fuse
+          - name: linux-arm64-nofuse
+            goos: linux
+            goarch: arm64
+            goarm: ""
+            tags: ""
+          - name: linux-armv7
+            goos: linux
+            goarch: arm
+            goarm: "7"
+            tags: ""
+          - name: linux-armv6
+            goos: linux
+            goarch: arm
+            goarm: "6"
+            tags: ""
+          # 纯静态 GOOS=linux 产物一律是 ET_EXEC 非 PIE（实测：arm64/armv6 都是）。
+          # Android 9+ 是否拒绝非 PIE 需真机验证，故另出 static-pie job（musl 静态 PIE）。
+          # 不再尝试 GOOS=android：run #9 实测 arm64 报 wlynxg/anet 的
+          # "invalid reference to net.zoneCache"（该依赖为 anacrolix/torrent 传递引入），
+          # 且 ubuntu-24.04 runner 上也没有 gcc-aarch64-linux-android 这个包。
+
+    continue-on-error: ${{ matrix.experimental == true }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            V="${{ github.event.inputs.tag_name }}"
+          elif [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+            V="${GITHUB_REF#refs/tags/}"
+          else
+            V="$(git rev-parse --short HEAD)"
+          fi
+          echo "value=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        env:
+          GOTOOLCHAIN: local
+          OUT: litepan-${{ steps.ver.outputs.value }}-${{ matrix.name }}
+          TAGS: ${{ matrix.tags }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: "0"
+        run: |
+          set -eux
+          EXTRA_TAGS=""
+          if [ -n "$TAGS" ]; then EXTRA_TAGS="-tags $TAGS"; fi
+          go build $EXTRA_TAGS -trimpath -ldflags="-s -w" -o "$OUT" "$BIN_PKG"
+          strip "$OUT" || true
+          ls -l "$OUT"
+          sha256sum "$OUT" | tee "${OUT}.sha256"
+
+      # 每个产物都校验 ELF 头：只有 PT_INTERP 是硬判据（e_flags 对 Go 产物无区分度）。
+      - name: Verify ELF for Android
+        run: |
+          set -eux
+          python3 .github/scripts/check_elf_android.py \
+            "litepan-${{ steps.ver.outputs.value }}-${{ matrix.name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.ver.outputs.value }}-${{ matrix.name }}
+          path: litepan-*
+          if-no-files-found: error
+
+  # 静态 PIE 兜底：给「内核强制 PIE」的机型（Android 9+ 待真机确认）。
+  # 代价是必须开 cgo(musl)：引入 musl 分配器全局锁 + cgo DNS，性能低于纯静态产物，
+  # 且 /etc 在 Android 上不存在，musl 同样读不到 resolv.conf —— 详见可行性报告。
+  static-pie:
+    name: ${{ matrix.name }} (musl, 实验性)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-armv7-pie
+            image: dockcross/linux-armv7l-musl
+            goarch: arm
+            goarm: "7"
+          - name: linux-arm64-pie
+            image: dockcross/linux-arm64-musl
+            goarch: arm64
+            goarm: ""
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            V="${{ github.event.inputs.tag_name }}"
+          elif [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+            V="${GITHUB_REF#refs/tags/}"
+          else
+            V="$(git rev-parse --short HEAD)"
+          fi
+          echo "value=$V" >> "$GITHUB_OUTPUT"
+          awk '/^go[ \t]+[0-9]/{print "go_ver="$2; exit}' go.mod >> "$GITHUB_OUTPUT"
+
+      - name: Build static PIE with dockcross + musl
+        run: |
+          set -eux
+          VER="${{ steps.ver.outputs.value }}"
+          GOVER="${{ steps.ver.outputs.go_ver }}"
+          test -n "$GOVER"
+          docker run --rm ${{ matrix.image }} > ./dockcross
+          chmod +x ./dockcross
+          # dockcross 的 cc 包装器只转发它自己那组变量（CC/CXX 等），自定义变量进容器
+          # 一律 unbound（run #9 就是这么炸的）。所以把容器脚本落成文件、用位置参数传入。
+          cat > build-in-musl-container.sh <<'OUTER'
+          VER="$1"
+          GOVER="$2"
+          GOARCH="$3"
+          GOARM="$4"
+          NAME="$5"
+          cat > inside.sh <<'INNER'
+          set -eux
+          echo "go=$GOVER arch=$GOARCH arm=$GOARM out=$NAME"
+          "$CC" --version | head -1
+          curl -sSL "https://go.dev/dl/go${GOVER}.linux-amd64.tar.gz" -o /tmp/go.tgz
+          tar -C /usr/local -xzf /tmp/go.tgz
+          export PATH=/usr/local/go/bin:"$PATH"
+          export GOTOOLCHAIN=local CGO_ENABLED=1 GOOS=linux GOARCH="$GOARCH"
+          if [ -n "$GOARM" ]; then export GOARM="$GOARM"; fi
+          OUT="$NAME"
+          go build -buildmode=pie -trimpath -ldflags "-s -w -linkmode external -extldflags=-static" -o "$OUT" ./cmd/litepan
+          ls -l "$OUT"
+          INNER
+          export VER GOVER GOARCH GOARM NAME
+          bash inside.sh
+          OUTER
+          ./dockcross bash ./build-in-musl-container.sh \
+            "$VER" "$GOVER" "${{ matrix.goarch }}" "${{ matrix.goarm }}" \
+            "litepan-${VER}-${{ matrix.name }}"
+          sudo chown -R "$(id -u):$(id -g)" litepan-*
+          sha256sum litepan-* | tee "litepan-${VER}-${{ matrix.name }}.sha256"
+          ls -l litepan-*
+
+      - name: Verify ELF for Android
+        run: |
+          set -eux
+          python3 .github/scripts/check_elf_android.py \
+            "litepan-${{ steps.ver.outputs.value }}-${{ matrix.name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.ver.outputs.value }}-${{ matrix.name }}
+          path: litepan-*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [build, static-pie]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
